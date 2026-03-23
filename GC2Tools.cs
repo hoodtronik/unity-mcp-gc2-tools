@@ -44,6 +44,9 @@ namespace ARBrawler.Editor.MCPTools
                     "setup_mannequin" => SetupMannequin(@params),
                     "setup_combos" => SetupCombos(@params),
                     "assign_combos_to_weapon" => AssignCombosToWeapon(@params),
+                    "inspect_character" => InspectCharacter(@params),
+                    "remove_child" => RemoveChild(@params),
+                    "configure_animator" => ConfigureAnimator(@params),
                     _ => new ErrorResponse($"Unknown action: {action}")
                 };
             }
@@ -99,33 +102,68 @@ namespace ARBrawler.Editor.MCPTools
             if (animator == null)
                 animator = instance.AddComponent<Animator>();
 
+            // Auto-detect and assign Avatar from the FBX
+            Avatar avatar = null;
+            Object[] subAssets = AssetDatabase.LoadAllAssetsAtPath(fbxPath);
+            foreach (Object sub in subAssets)
+            {
+                if (sub is Avatar av)
+                {
+                    avatar = av;
+                    break;
+                }
+            }
+            if (avatar != null && animator != null)
+            {
+                animator.avatar = avatar;
+            }
+
             // Set model as mannequin on the Character component
+            // Path: Character.m_Kernel (SerializeReference) -> CharacterKernel.m_Animim (SerializeReference) -> TUnitAnimim.m_Mannequin/m_Animator
             Character character = target.GetComponent<Character>();
+            bool mannequinSet = false;
+            bool animatorSet = false;
             if (character != null)
             {
                 SerializedObject so = new SerializedObject(character);
                 
-                // Set the mannequin reference
-                var animimProp = so.FindProperty("m_Animim");
-                if (animimProp != null)
+                // Correct path through the SerializeReference chain
+                var mannequinProp = so.FindProperty("m_Kernel.m_Animim.m_Mannequin");
+                var animatorProp = so.FindProperty("m_Kernel.m_Animim.m_Animator");
+                
+                if (mannequinProp != null)
                 {
-                    var mannequinProp = animimProp.FindPropertyRelative("m_Mannequin");
-                    if (mannequinProp != null)
-                    {
-                        mannequinProp.objectReferenceValue = animator;
-                        so.ApplyModifiedProperties();
-                    }
+                    mannequinProp.objectReferenceValue = instance.transform;
+                    mannequinSet = true;
                 }
-
+                else
+                {
+                    Debug.LogWarning("[gc2_tools] Could not find m_Kernel.m_Animim.m_Mannequin property");
+                }
+                
+                if (animatorProp != null)
+                {
+                    animatorProp.objectReferenceValue = animator;
+                    animatorSet = true;
+                }
+                else
+                {
+                    Debug.LogWarning("[gc2_tools] Could not find m_Kernel.m_Animim.m_Animator property");
+                }
+                
+                so.ApplyModifiedProperties();
                 EditorUtility.SetDirty(target);
             }
 
-            return new SuccessResponse($"Mannequin '{fbxPrefab.name}' set up on '{target.name}'. Animator found: {animator != null}",
+            return new SuccessResponse($"Mannequin '{fbxPrefab.name}' set up on '{target.name}'. Mannequin assigned: {mannequinSet}, Animator assigned: {animatorSet}, Avatar: {(avatar != null ? avatar.name : "none")}",
                 new JObject
                 {
                     ["target"] = target.name,
                     ["mannequin"] = instance.name,
                     ["hasAnimator"] = animator != null,
+                    ["mannequinAssigned"] = mannequinSet,
+                    ["animatorAssigned"] = animatorSet,
+                    ["avatar"] = avatar != null ? avatar.name : "none",
                     ["instanceID"] = instance.GetInstanceID()
                 });
         }
@@ -525,6 +563,206 @@ namespace ARBrawler.Editor.MCPTools
 
             return new SuccessResponse($"Assigned '{combos.name}' → '{weapon.name}'",
                 new JObject { ["weapon"] = weapon.name, ["combos"] = combos.name });
+        }
+
+        // ─── NEW ACTIONS ───────────────────────────────────────────────────
+
+        /// <summary>
+        /// Inspect a Character's setup: mannequin, animator, avatar, player flag, children.
+        /// params: target (instanceID or name)
+        /// </summary>
+        private static object InspectCharacter(JObject @params)
+        {
+            string targetName = @params["target"]?.ToString();
+            if (string.IsNullOrEmpty(targetName))
+                return new ErrorResponse("Required: 'target'");
+
+            GameObject target = FindGameObject(targetName);
+            if (target == null)
+                return new ErrorResponse($"GameObject not found: {targetName}");
+
+            Character character = target.GetComponent<Character>();
+            if (character == null)
+                return new ErrorResponse($"No Character component on: {targetName}");
+
+            var so = new SerializedObject(character);
+
+            // Read key properties
+            bool isPlayer = so.FindProperty("m_IsPlayer")?.boolValue ?? false;
+
+            // Animim references
+            var mannequinProp = so.FindProperty("m_Kernel.m_Animim.m_Mannequin");
+            var animatorProp = so.FindProperty("m_Kernel.m_Animim.m_Animator");
+            var startStateProp = so.FindProperty("m_Kernel.m_Animim.m_StartState");
+
+            Transform mannequin = mannequinProp?.objectReferenceValue as Transform;
+            Animator animator = animatorProp?.objectReferenceValue as Animator;
+            Object startState = startStateProp?.objectReferenceValue;
+
+            // Children info
+            var children = new JArray();
+            for (int i = 0; i < target.transform.childCount; i++)
+            {
+                var child = target.transform.GetChild(i);
+                var childAnimator = child.GetComponent<Animator>();
+                var childInfo = new JObject
+                {
+                    ["name"] = child.name,
+                    ["instanceID"] = child.gameObject.GetInstanceID(),
+                    ["hasAnimator"] = childAnimator != null,
+                    ["isPrefabInstance"] = PrefabUtility.IsPartOfPrefabInstance(child.gameObject),
+                    ["childCount"] = child.childCount
+                };
+                if (childAnimator != null)
+                {
+                    childInfo["avatarName"] = childAnimator.avatar != null ? childAnimator.avatar.name : "none";
+                    childInfo["controllerName"] = childAnimator.runtimeAnimatorController != null ? childAnimator.runtimeAnimatorController.name : "none";
+                }
+                // Check if it's a prefab and get source
+                if (PrefabUtility.IsPartOfPrefabInstance(child.gameObject))
+                {
+                    var prefabAsset = PrefabUtility.GetCorrespondingObjectFromSource(child.gameObject);
+                    if (prefabAsset != null)
+                    {
+                        childInfo["prefabSource"] = AssetDatabase.GetAssetPath(prefabAsset);
+                    }
+                }
+                children.Add(childInfo);
+            }
+
+            return new SuccessResponse($"Character inspection: {target.name}",
+                new JObject
+                {
+                    ["name"] = target.name,
+                    ["isPlayer"] = isPlayer,
+                    ["mannequin"] = mannequin != null ? mannequin.name : "(none)",
+                    ["mannequinAssigned"] = mannequin != null,
+                    ["animator"] = animator != null ? animator.name : "(none)",
+                    ["animatorAssigned"] = animator != null,
+                    ["avatar"] = animator != null && animator.avatar != null ? animator.avatar.name : "(none)",
+                    ["startState"] = startState != null ? startState.name : "(none)",
+                    ["hasCharacterController"] = target.GetComponent<CharacterController>() != null,
+                    ["children"] = children
+                });
+        }
+
+        /// <summary>
+        /// Remove a named child (or all children) from a target GameObject.
+        /// params: target, child_name (optional, removes all if omitted), match_type ("exact" or "contains", default "exact")
+        /// </summary>
+        private static object RemoveChild(JObject @params)
+        {
+            string targetName = @params["target"]?.ToString();
+            string childName = @params["child_name"]?.ToString();
+            string matchType = @params["match_type"]?.ToString() ?? "exact";
+
+            if (string.IsNullOrEmpty(targetName))
+                return new ErrorResponse("Required: 'target'");
+
+            GameObject target = FindGameObject(targetName);
+            if (target == null)
+                return new ErrorResponse($"GameObject not found: {targetName}");
+
+            var removed = new JArray();
+            for (int i = target.transform.childCount - 1; i >= 0; i--)
+            {
+                var child = target.transform.GetChild(i);
+                bool shouldRemove = false;
+
+                if (string.IsNullOrEmpty(childName))
+                {
+                    shouldRemove = true;  // Remove all
+                }
+                else if (matchType == "contains")
+                {
+                    shouldRemove = child.name.IndexOf(childName, StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+                else
+                {
+                    shouldRemove = child.name.Equals(childName, StringComparison.OrdinalIgnoreCase);
+                }
+
+                if (shouldRemove)
+                {
+                    removed.Add(new JObject
+                    {
+                        ["name"] = child.name,
+                        ["instanceID"] = child.gameObject.GetInstanceID()
+                    });
+                    Undo.DestroyObjectImmediate(child.gameObject);
+                }
+            }
+
+            EditorUtility.SetDirty(target);
+            return new SuccessResponse($"Removed {removed.Count} child(ren) from '{target.name}'",
+                new JObject { ["removed"] = removed });
+        }
+
+        /// <summary>
+        /// Configure an Animator component on a child of a target: set Avatar from an FBX.
+        /// params: target, child_name (optional, uses first child with Animator), fbx_path (for Avatar lookup)
+        /// </summary>
+        private static object ConfigureAnimator(JObject @params)
+        {
+            string targetName = @params["target"]?.ToString();
+            string childName = @params["child_name"]?.ToString();
+            string fbxPath = @params["fbx_path"]?.ToString();
+
+            if (string.IsNullOrEmpty(targetName))
+                return new ErrorResponse("Required: 'target'");
+
+            GameObject target = FindGameObject(targetName);
+            if (target == null)
+                return new ErrorResponse($"GameObject not found: {targetName}");
+
+            // Find Animator on a child
+            Animator animator = null;
+            if (!string.IsNullOrEmpty(childName))
+            {
+                Transform child = target.transform.Find(childName);
+                if (child != null) animator = child.GetComponent<Animator>();
+                // Also check nested children
+                if (animator == null && child != null)
+                    animator = child.GetComponentInChildren<Animator>();
+            }
+            if (animator == null)
+                animator = target.GetComponentInChildren<Animator>();
+            if (animator == null)
+                return new ErrorResponse($"No Animator found on '{targetName}' or its children");
+
+            // Load Avatar from FBX
+            Avatar avatar = null;
+            if (!string.IsNullOrEmpty(fbxPath))
+            {
+                Object[] subAssets = AssetDatabase.LoadAllAssetsAtPath(fbxPath);
+                foreach (Object sub in subAssets)
+                {
+                    if (sub is Avatar av)
+                    {
+                        avatar = av;
+                        break;
+                    }
+                }
+
+                if (avatar != null)
+                {
+                    Undo.RecordObject(animator, "Configure Animator Avatar");
+                    animator.avatar = avatar;
+                    EditorUtility.SetDirty(animator);
+                }
+                else
+                {
+                    return new ErrorResponse($"No Avatar found in FBX: {fbxPath}");
+                }
+            }
+
+            return new SuccessResponse($"Configured Animator on '{animator.gameObject.name}': Avatar={avatar?.name ?? "unchanged"}",
+                new JObject
+                {
+                    ["gameObject"] = animator.gameObject.name,
+                    ["avatar"] = avatar != null ? avatar.name : "unchanged",
+                    ["instanceID"] = animator.gameObject.GetInstanceID()
+                });
         }
 
         private static void SetField(object target, string fieldName, object value)
